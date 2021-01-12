@@ -1,17 +1,43 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
 #include <Wire.h>
 #include <MPU6050.h>
+#include <math.h>
 
-MPU6050 mpu;
+// Forward Declarations //
+float clampAngle(float);
+void updateHeading();
+void updatePosition();
+void side1(int);
+void side2(int);
+void fixTrajectory(float);
 
-// Timers
+// Timers //
 unsigned long timer = 0;
 float timeStep = 0.01;
 
-// Pitch, Roll and Yaw values
-//float pitch = 0;
+// Control Knowledge //
 float roll = 0;
-//float yaw = 0;
+double pos[1][2];
+const double waypoint[15][2] = 
+{{36.437549,-94.201316},
+{36.437549,-94.201316},
+{36.437549,-94.201316},
+{36.437583,-94.201263},
+{36.437583,-94.201263},
+{36.437583,-94.201263},
+{36.437583,-94.201164},
+{36.437583,-94.201164},
+{36.437583,-94.201164},
+{36.437450,-94.201164},
+{36.437450,-94.201164},
+{36.437450,-94.201164},
+{36.437564,-94.201316},
+{36.437564,-94.201316},
+{36.437564,-94.201316}};
 
+
+// Hardware Init. //
 int side1motor1pin1 = 3;
 int side1motor1pin2 = 2; //pwm
 int side1motor2pin1 = 5;
@@ -21,26 +47,32 @@ int side2motor1pin2 = 7; //pwm
 int side2motor2pin1 = 8;
 int side2motor2pin2 = 9; //pwm
 
-int toggle{1};
+TinyGPSPlus gps;
+MPU6050 mpu;
+SoftwareSerial ss(10, 11);
 
-float angle{90.0};
+// META Information //
+
+//TODO: ADD WAYPOINT VARIABLE
+int currentWaypoint{0};        // Index of currently used waypoint
+float angle{0};                   // The angle which it strives to reach
+
+// Independent Variables //
+const float ROTATION_SENSITIVITY{5.0}; //the lower it is, the more accurate it is, albeit harder to achieve.
+const long WAYPOINT_SENSITIVITY{5.0};
 
 
-const float ROTATION_SENSITIVITY{5.0}; //the lower the more accurate and harder to achieve.
-
-void setup()
-{
-  
+void setup(){
   Serial.begin(115200);
-  
   // Initialize MPU6050
   while (!mpu.begin(MPU6050_SCALE_2000DPS, MPU6050_RANGE_2G)){
-      Serial.println("Could not find a valid MPU6050 sensor, check wiring!");
+      Serial.println("MPU6050 NOT FOUND! Check wiring!");
       delay(500);
   }
   mpu.calibrateGyro();
   mpu.setThreshold(3); 
 
+  // Initialize Motors
   pinMode(side1motor1pin1, OUTPUT);
   pinMode(side1motor1pin2, OUTPUT);
   pinMode(side1motor1pin1, OUTPUT);
@@ -49,95 +81,86 @@ void setup()
   pinMode(side2motor1pin2, OUTPUT);
   pinMode(side2motor2pin2, OUTPUT);
   pinMode(side2motor2pin2, OUTPUT);
-
+  // Delay for startup (to prevent sudden chaos!)
   delay(10000);
 }
 
 
-void loop()
-{
-  getCurrentHeading();
-  //if (toggle == 1) {
-      if ( (angle == roll || (clampAngle(roll-angle)) < ROTATION_SENSITIVITY) == false){
-    faceAngle(90);
-//  
-    }
-    else if(toggle==0){
-      toggle=1;
-      Serial.println("CORRECT");
-      side1(0);
-      side2(0);
-      delay(1000);
-      
-    }
-    else{
-      side1(0);
-      Serial.print("FINISHED WITH ERROR: ");
-      Serial.println( abs(angle-roll));
-      side2(0);
-    }
-    
-
+void loop(){
+  updateHeading(); // DEBUG: Make sure these are actually updating
+  updatePosition();
   
   delay((timeStep * 1000) - (millis() - timer)); //global timestep with latency elimination
-
 }
 
-float getCurrentHeading(){
-  
-    timer = millis();
-
-      Vector norm = mpu.readNormalizeGyro();
-
-
-    //pitch = pitch + norm.YAxis * timeStep;
-    roll = roll + norm.XAxis * timeStep;
-    if (roll < 0){roll += 360;}
-    if (roll > 360){ roll=0; }
-    //yaw = yaw + norm.ZAxis * timeStep;
-    return roll;
-}
-
-
-int faceAngle(float angle){
-
-  //later on, add ability to check to see error value for a given sensitivity; use angle to determine estemated finishing coordonates, and calculate the distance between the est. coordonates and desired ones.
-  if (angle == roll || (clampAngle(roll-angle)) < ROTATION_SENSITIVITY){
-    side1(0);
-    Serial.println("ALLDONE");
-    side2(0);
-    toggle += 1;
-    //Serial.println(toggle);
-    return 1; //fail: unrequired
-  }
-  else{
-    Serial.println(clampAngle(angle-roll));
-   //left or right?
-   if(clampAngle(angle-roll)  > 180){ //right
-    Serial.println("RIGHT");
-    side2(0);
-    side1(1);
-   }
-   else{
-    Serial.println("LEFT");
-    side1(0);
-    side2(1);
-   }
-
+void navigate(){
+   createAngle(pos[0][0], pos[0][1], waypoint[currentWaypoint][0], waypoint[currentWaypoint][1]); //new angle based on new position TODO: check for major discrepencies to ensure nothings wrong
    
-  //while( !(angle == roll || abs(clampAngle(roll-angle < ROTATION_SENSITIVITY)))) {getCurrentHeading();} //do nothing until equals roll
-  return 0;
+   if ( (angle == roll || (clampAngle(roll-angle)) < ROTATION_SENSITIVITY) == false){
+      fixTrajectory(angle);
+   } else if( findHypotenuse(pos[0][0], pos[0][1], waypoint[currentWaypoint][0], waypoint[currentWaypoint][1] ) > WAYPOINT_SENSITIVITY){
+      side1(1);
+      side2(1);
+   } else{
+      currentWaypoint++;
+   }
 }
+
+  
+void updatePosition(){
+  while (ss.available() > 0)
+    if (gps.encode(ss.read())){
+      pos[0][0] = gps.location.lat(); // DEBUG: TRY SWITCHING THEM AROUND
+      pos[0][1] = gps.location.lng();
+    }
+      
+}
+
+void updateHeading(){
+    timer = millis();
+    
+    Vector norm = mpu.readNormalizeGyro();
+    roll = roll + norm.XAxis * timeStep;
+    roll = clampAngle(roll);
+}
+
+
+float createAngle(double x1, double y1, double x2, double y2){ //x1/y1 is currnt pos
+    double t1 = x2-x1;
+    double t2 = y2-y1;
+    double t3 = sqrt(t1*t1+t2*t2);
+    double sinOfT1T3 = t1/t3;
+    float toAngle = ( pow(sinOfT1T3, -1) * 180 ) / 3.14159 ;
+    return toAngle;
+}
+
+float findHypotenuse(double x1, double y1, double x2, double y2){ //x1/y1 is currnt pos
+    double t1 = x2-x1;
+    double t2 = y2-y1;
+    double t3 = sqrt(t1*t1+t2*t2);
+    return t3;
+}
+
+void fixTrajectory(float angle){
+  //later on, add ability to check to see error value for a given sensitivity; use angle to determine estemated finishing coordonates, and calculate the distance between the est. coordonates and desired ones.
+    if(clampAngle(angle-roll)  > 180){ //right
+      side2(0);
+      side1(1);
+    }
+    else{                              //left
+      side1(0);
+      side2(1);
+    }
+  
+}
+
+  
+  float clampAngle(float val){
+      if (val < 0)   {val += 360;}
+      if (val > 360) { val = 0  ;}
+      return val;
   }
 
-
-
-float clampAngle(float roll){
-    if (roll < 0){roll += 360;}
-    if (roll > 360){ roll=0; }
-
-    return roll;
-}
 
 void side1(int operation){
   switch(operation){
@@ -152,14 +175,15 @@ void side1(int operation){
   }
 }
 
+
 void side2(int operation){
   switch(operation){
     case 0:
-            digitalWrite(side2motor1pin2, LOW);
+      digitalWrite(side2motor1pin2, LOW);
       digitalWrite(side2motor2pin1, LOW);
       break;
     case 1:
-            digitalWrite(side2motor1pin2, HIGH);
+      digitalWrite(side2motor1pin2, HIGH);
       digitalWrite(side2motor2pin1, HIGH);
       break;
   }
